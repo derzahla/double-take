@@ -1,76 +1,22 @@
-const fs = require('fs');
-const sizeOf = require('probe-image-size');
-const crypto = require('crypto');
-const objhasher = require('object-hash');
-const database = require('../util/db.util');
-const filesystem = require('../util/fs.util');
-const { tryParseJSON } = require('../util/validators.util');
-const { jwt } = require('../util/auth.util');
-const process = require('../util/process.util');
-const { AUTH, STORAGE, UI } = require('../constants')();
-const { BAD_REQUEST, NOT_FOUND, SERVER_ERROR } = require('../constants/http-status');
-const DETECTORS = require('../constants/config').detectors();
-const Cache = require('../util/cache.util');
-
-const db = database.connect();
 const format = async (matches) => {
-  let token;
-  try {
-    token = AUTH && matches.length ? jwt.sign({ route: 'storage' }) : null;
-  } catch (error) {
-    // Handle JWT signing errors
-    console.error('JWT signing error:', error);
-    token = null;
-  }
-
-  const formattedMatches = await Promise.all(
+  const token = AUTH && matches.length ? jwt.sign({ route: 'storage' }) : null;
+  matches = await Promise.all(
     matches.map(async (obj) => {
-      const { id, filename, event, response, isTrained, createdAt } = obj;
+      const { id, filename, event, response, isTrained } = obj;
 
-      let camera;
-      let type;
-      let zones;
-      let updatedAt;
-      try {
-        // Attempt to clean up and parse the JSON string
-        const cleanedEvent = event.replace(/^\ufeff/, '').trim();
-        const eventObject = JSON.parse(cleanedEvent);
-        camera = eventObject.camera;
-        type = eventObject.type;
-        zones = eventObject.zones;
-        updatedAt = eventObject.updatedAt;
-      } catch (error) {
-        // Handle JSON parsing errors for event
-        console.error('Event parsing error:', error, String(event));
-        // Defaulting the values when an error occurs,
-
-        camera = '';
-        type = '';
-        zones = [];
-        updatedAt = null;
+      // Ensure event is properly parsed and is a string
+      let parsedEvent;
+      if (typeof event === 'string') {
+        parsedEvent = JSON.parse(event);
+      } else {
+        parsedEvent = event;
       }
 
-      let parsedResponse;
-      try {
-        const clearedResponse = response.replace(/^\ufeff/, '').trim();
-        parsedResponse = JSON.parse(clearedResponse);
-      } catch (error) {
-        // Handle JSON parsing errors for response
-        console.error('Response parsing error:', error, String(response));
-      }
-
-      let width = 0;
-      let height = 0;
+      const { camera, type, zones, updatedAt } = parsedEvent;
       const key = `matches/${filename}`;
-
-      try {
-        const dimensions = await sizeOf(fs.createReadStream(`${STORAGE.MEDIA.PATH}/${key}`));
-        width = dimensions.width;
-        height = dimensions.height;
-      } catch (error) {
-        // Handle errors related to reading the file or getting its size
-        console.error('File read/size error:', error);
-      }
+      const { width, height } = await sizeOf(
+        fs.createReadStream(`${STORAGE.MEDIA.PATH}/${key}`)
+      ).catch((/* error */) => ({ width: 0, height: 0 }));
 
       return {
         id,
@@ -84,15 +30,14 @@ const format = async (matches) => {
           height,
         },
         isTrained: !!isTrained,
-        response: parsedResponse,
-        createdAt,
+        response: typeof response === 'string' ? JSON.parse(response) : response,
+        createdAt: obj.createdAt,
         updatedAt: updatedAt || null,
         token,
       };
     })
   );
-
-  return formattedMatches;
+  return matches;
 };
 
 module.exports.post = async (req, res) => {
@@ -102,62 +47,38 @@ module.exports.post = async (req, res) => {
   const { filters } = req.body;
   const tmptable = crypto.createHash('md5').digest('hex').toString();
 
-  const filtersHash = objhasher(filters);
+  const db = database.connect();
 
-  if (
-    !filters ||
-    !Object.keys(filters).length ||
-    (Cache.get('filters') &&
-      Cache.get('filters').detectors.length === filters.detectors.length &&
-      Cache.get('filters').names.length === filters.names.length &&
-      Cache.get('filters').matches.length === filters.matches.length &&
-      Cache.get('filters').cameras.length === filters.cameras.length &&
-      Cache.get('filters').types.length === filters.types.length &&
-      filters.confidence + filters.width + filters.height === 0 &&
-      Cache.get('filters').gender &&
-      Cache.get('filters').gender?.value === filters.gender?.value)
-  ) {
-    // TOODO: Optimize by using a single query to get the count and the matches
-    const query = `
-        SELECT
-        m.*,
-        t.filename as isTrained
-      FROM match m
-      LEFT JOIN (SELECT filename FROM train GROUP BY filename) t ON t.filename = m.filename
-      ORDER BY m.createdAt DESC
-      LIMIT ? OFFSET ?`;
-    console.verbose('no filters, using single query');
+  if (!filters || !Object.keys(filters).length) {
+    const [total] = db.prepare(`SELECT COUNT(*) count FROM match`).all();
+    const matches = db
+      .prepare(
+        `SELECT * FROM match
+          LEFT JOIN (SELECT filename as isTrained FROM train GROUP BY filename) train ON train.isTrained = match.filename
+          ORDER BY createdAt DESC
+          LIMIT ?,?`
+      )
+      .bind(limit * (page - 1), limit)
+      .all();
 
-    const matches = db.prepare(query).all(limit, limit * (page - 1));
-
-    const total = Cache.get('filters')
-      ? Cache.get('filters').total
-      : database.get.tableRows('match');
-
-    return res.send({
-      total,
-      limit,
-      matches: await format(matches),
-    });
+    return res.send({ total: total.count, limit, matches: await format(matches) });
   }
 
   const confidenceQuery =
-    filters.confidence === 0 ? `OR jsonb_extract(value, '$.confidence') IS NULL` : '';
+    filters.confidence === 0 ? `OR json_extract(value, '$.confidence') IS NULL` : '';
 
-  // architecture proёb :(
   db.prepare(
-    `CREATE TEMPORARY TABLE IF NOT EXISTS ${tmptable} AS SELECT t.id, t.createdAt, t.filename, json(t.event) as event, response, detector, json(value) as value, isTrained FROM (
-    SELECT match.id, match.createdAt, match.filename, event, json_extract(value, '$.detector') detector, json_extract(value, '$.results') results, json(match.response) as response
+    `CREATE TEMPORARY TABLE IF NOT EXISTS ${tmptable} AS SELECT t.id, t.createdAt, t.filename, t.event, response, detector, value FROM (
+    SELECT match.id, match.createdAt, match.filename, event, json_extract(value, '$.detector') detector, json_extract(value, '$.results') results, match.response
     FROM match, json_each( match.response)
-    ) t, json_each(t.results) LEFT JOIN (SELECT filename as isTrained FROM train GROUP BY filename) train ON train.isTrained = t.filename
-  WHERE jsonb_extract(value, '$.name') IN (${database.params(filters.names)})
-  AND jsonb_extract(value, '$.match') IN (${database.params(filters.matches)})
-  AND jsonb_extract(t.event, '$.camera') IN (${database.params(filters.cameras)})
-  AND jsonb_extract(t.event, '$.type') IN (${database.params(filters.types)})
-  AND (jsonb_extract(value, '$.confidence') >= ? ${confidenceQuery})
-  AND jsonb_extract(value, '$.box.width') >= ?
-  AND jsonb_extract(value, '$.box.height') >= ?
-  /* AND jsonb_extract(value, '$.gender') IN (${database.params(filters.genders)}) */
+    ) t, json_each(t.results)
+  WHERE json_extract(value, '$.name') IN (${database.params(filters.names)})
+  AND json_extract(value, '$.match') IN (${database.params(filters.matches)})
+  AND json_extract(t.event, '$.camera') IN (${database.params(filters.cameras)})
+  AND json_extract(t.event, '$.type') IN (${database.params(filters.types)})
+  AND (json_extract(value, '$.confidence') >= ? ${confidenceQuery})
+  AND json_extract(value, '$.box.width') >= ?
+  AND json_extract(value, '$.box.height') >= ?
   AND detector IN (${database.params(filters.detectors)})
         GROUP BY t.id`
   ).run(
@@ -168,32 +89,29 @@ module.exports.post = async (req, res) => {
     filters.confidence,
     filters.width,
     filters.height,
-    // filters.genders,
     filters.detectors
   );
+
   db.prepare(`SELECT * FROM ${tmptable}`)
     .all()
     .map((obj) => obj.id);
 
-  let total;
-  if (Cache.get(filtersHash)) {
-    total = Cache.get(filtersHash);
-  } else {
-    [total] = db
-      .prepare(
-        `SELECT COUNT(*) count FROM ${tmptable}
-    WHERE id > ?`
-      )
-      .bind(sinceId || 0)
-      .all();
-    Cache.set(filtersHash, total, 60);
-  }
+  const [total] = db
+    .prepare(
+      `SELECT COUNT(*) count FROM ${tmptable}
+      WHERE id > ?
+      ORDER BY createdAt DESC`
+    )
+    .bind(sinceId || 0)
+    .all();
+
   const matches = db
     .prepare(
       `SELECT * FROM ${tmptable}
-      WHERE id > ?
-      ORDER BY createdAt DESC
-      LIMIT ?,?`
+    LEFT JOIN (SELECT filename as isTrained FROM train GROUP BY filename) train ON train.isTrained = ${tmptable}.filename
+        WHERE id > ?
+        ORDER BY createdAt DESC
+        LIMIT ?,?`
     )
     .bind(sinceId || 0, limit * (page - 1), limit)
     .all();
@@ -203,54 +121,28 @@ module.exports.post = async (req, res) => {
   res.send({ total: total.count, limit, matches: await format(matches) });
 };
 
-module.exports.delete = async (req, res) => {
-  const { ids } = req.body;
-  if (ids.length) {
-    // Optimize by using a transaction for batch deletion
-    db.transaction(() => {
-      const files = db
-        .prepare(`SELECT filename FROM match WHERE id IN (${database.params(ids)})`)
-        .all(ids);
-
-      db.prepare(`DELETE FROM match WHERE id IN (${database.params(ids)})`).run(ids);
-
-      files.forEach(({ filename }) => {
-        filesystem.delete(`${STORAGE.MEDIA.PATH}/matches/${filename}`);
-      });
-    })();
-  }
-
-  res.send({ success: true });
-};
-
 module.exports.reprocess = async (req, res) => {
   const { matchId } = req.params;
   if (!DETECTORS.length) return res.status(BAD_REQUEST).error('no detectors configured');
 
-  let [match] = db
-    .prepare('SELECT *,json(event) as event FROM match WHERE id = ?')
-    .bind(matchId)
-    .all();
+  const db = database.connect();
+  let [match] = db.prepare('SELECT * FROM match WHERE id = ?').bind(matchId).all();
 
   if (!match) return res.status(BAD_REQUEST).error('No match found');
 
-  try {
-    const results = await process.start({
-      camera: tryParseJSON(match.event) ? tryParseJSON(match.event).camera : null,
-      filename: match.filename,
-      tmp: `${STORAGE.MEDIA.PATH}/matches/${match.filename}`,
-    });
-    database.update.match({
-      id: match.id,
-      event: JSON.parse(match.event),
-      response: results,
-    });
-  } catch (err) {
-    console.error(err);
-    return res.status(SERVER_ERROR).json({ error: 'Processing failure' });
-  }
+  const results = await process.start({
+    camera: tryParseJSON(match.event) ? tryParseJSON(match.event).camera : null,
+    filename: match.filename,
+    tmp: `${STORAGE.MEDIA.PATH}/matches/${match.filename}`,
+  });
 
-  const matches = await db
+  database.update.match({
+    id: match.id,
+    event: JSON.parse(match.event),
+    response: results,
+  });
+
+  match = db
     .prepare(
       `SELECT * FROM match
       LEFT JOIN (SELECT filename as isTrained FROM train GROUP BY filename) train ON train.isTrained = match.filename
@@ -258,104 +150,7 @@ module.exports.reprocess = async (req, res) => {
     )
     .bind(matchId)
     .all();
-  if (!matches.length) {
-    return res.status(NOT_FOUND).json({ error: 'No match found post-processing' });
-  }
-  [match] = await format(matches);
+  [match] = await format(match);
 
   res.send(match);
-};
-
-module.exports.filters = async (req, res) => {
-  console.debug('Fetching filters...');
-
-  if (Cache.get('filters')) {
-    console.debug('Filters retrieved from cache.');
-    return res.send(Cache.get('filters'));
-  }
-
-  try {
-    // Uncomment and update the following line with actual database connection logic if necessary
-    // const db = database.connect();
-
-    console.debug('Retrieving total count from database...');
-    const [total] = db.prepare('SELECT COUNT(*) count FROM match').all();
-    console.debug(`Total count: ${total.count}`);
-
-    console.debug('Retrieving detectors from database...');
-    const detectors = db
-      .prepare(
-        `SELECT json_extract(value, '$.detector') name
-        FROM match, json_each(match.response)
-        GROUP BY name
-        ORDER BY name ASC`
-      )
-      .all()
-      .map((obj) => obj.name);
-    console.debug(`Detectors: ${detectors}`);
-
-    console.debug('Retrieving names from database...');
-    const names = db
-      .prepare(
-        `SELECT json_extract(value, '$.name') name FROM (
-            SELECT jsonb_extract(value, '$.results') results
-        FROM match, json_each(match.response)
-            ) t, json_each(t.results)
-        GROUP BY name
-        ORDER BY name ASC`
-      )
-      .all()
-      .map((obj) => obj.name);
-    console.debug(`Names: ${names}`);
-
-    console.debug('Retrieving matches from database...');
-    const matches = db
-      .prepare(
-        `SELECT IIF(jsonb_extract(value, '$.match') == 1, 'match', 'miss') name FROM (
-            SELECT jsonb_extract(value, '$.results') results
-        FROM match, json_each(match.response)
-            ) t, json_each(t.results)
-        GROUP BY name
-        ORDER BY name ASC`
-      )
-      .all()
-      .map((obj) => obj.name);
-    console.debug(`Matches: ${matches}`);
-
-    console.debug('Retrieving cameras from database...');
-    const cameras = db
-      .prepare(
-        `SELECT json_extract(event, '$.camera') name
-        FROM match
-        GROUP BY name
-        ORDER BY name ASC`
-      )
-      .all()
-      .map((obj) => obj.name);
-    console.debug(`Cameras: ${cameras}`);
-
-    console.debug('Retrieving types from database...');
-    const types = db
-      .prepare(
-        `SELECT json_extract(event, '$.type') name
-        FROM match
-        GROUP BY name
-        ORDER BY name ASC`
-      )
-      .all()
-      .map((obj) => obj.name);
-    console.debug(`Types: ${types}`);
-
-    // console.debug('Assigning static genders...');
-    const genders = ['male', 'female'];
-
-    const result = { total: total.count, detectors, names, matches, cameras, types, genders };
-    Cache.set('filters', result, 120);
-    console.debug('Filters cached.');
-
-    res.send(result);
-  } catch (error) {
-    console.error(`An error occurred while fetching filters: ${error.message}`);
-    res.status(500).send({ error: 'An internal server error occurred' });
-  }
 };
