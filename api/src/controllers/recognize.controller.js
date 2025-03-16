@@ -206,9 +206,11 @@ module.exports.start = async (req, res) => {
     console.log(`done processing ${camera}: ${id} in ${duration} sec`);
 
     const loggedOutput = JSON.parse(JSON.stringify(output));
-    ['matches', 'misses', 'unknowns'].forEach((type) =>
-      loggedOutput[type].forEach((result) => delete result.base64)
-    );
+    ['matches', 'misses', 'unknowns'].forEach((type) => {
+      if (loggedOutput[type]) {
+        loggedOutput[type].forEach((result) => delete result.base64);
+      }
+    });
     console.log(loggedOutput);
 
     PROCESSING = false;
@@ -218,14 +220,14 @@ module.exports.start = async (req, res) => {
     mqtt.recognize(output);
     notify.publish(output, camera, results);
     if (event.type === 'frigate') frigate.subLabel(event.topic, id, best);
-    if (output.matches.length) IDS.push(id);
-    if (results.length) emit('recognize', true);
+    if (output.matches && output.matches.length) IDS.push(id);
+    if (results && results.length) emit('recognize', true);
     res.send(output);
   } catch (error) {
     PROCESSING = false;
     console.error(`An error occurred at ${error.stack}`);
     console.error(`An error occurred when recogniting file: ${error.message}`);
-    // res.send(error);
+    res.send(error);
   }
 };
 

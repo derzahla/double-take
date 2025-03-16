@@ -1,3 +1,15 @@
+const fs = require('fs');
+const sizeOf = require('probe-image-size');
+const crypto = require('crypto');
+const database = require('../util/db.util');
+const filesystem = require('../util/fs.util');
+const { tryParseJSON } = require('../util/validators.util');
+const { jwt } = require('../util/auth.util');
+const process = require('../util/process.util');
+const { AUTH, STORAGE, UI } = require('../constants')();
+const { BAD_REQUEST } = require('../constants/http-status');
+const DETECTORS = require('../constants/config').detectors();
+
 const format = async (matches) => {
   const token = AUTH && matches.length ? jwt.sign({ route: 'storage' }) : null;
   matches = await Promise.all(
@@ -121,6 +133,25 @@ module.exports.post = async (req, res) => {
   res.send({ total: total.count, limit, matches: await format(matches) });
 };
 
+module.exports.delete = async (req, res) => {
+  const { ids } = req.body;
+  if (ids.length) {
+    const db = database.connect();
+    const files = db
+      .prepare(`SELECT filename FROM match WHERE id IN (${database.params(ids)})`)
+      .bind(ids)
+      .all();
+
+    db.prepare(`DELETE FROM match WHERE id IN (${database.params(ids)})`).run(ids);
+
+    files.forEach(({ filename }) => {
+      filesystem.delete(`${STORAGE.MEDIA.PATH}/matches/${filename}`);
+    });
+  }
+
+  res.send({ success: true });
+};
+
 module.exports.reprocess = async (req, res) => {
   const { matchId } = req.params;
   if (!DETECTORS.length) return res.status(BAD_REQUEST).error('no detectors configured');
@@ -153,4 +184,66 @@ module.exports.reprocess = async (req, res) => {
   [match] = await format(match);
 
   res.send(match);
+};
+
+module.exports.filters = async (req, res) => {
+  const db = database.connect();
+
+  const [total] = db.prepare('SELECT COUNT(*) count FROM match').all();
+
+  const detectors = db
+    .prepare(
+      `SELECT json_extract(value, '$.detector') name
+        FROM match, json_each(match.response)
+        GROUP BY name
+        ORDER BY name ASC`
+    )
+    .all()
+    .map((obj) => obj.name);
+
+  const names = db
+    .prepare(
+      `SELECT json_extract(value, '$.name') name FROM (
+          SELECT json_extract(value, '$.results') results
+          FROM match, json_each(match.response)
+          ) t, json_each(t.results)
+        GROUP BY name
+        ORDER BY name ASC`
+    )
+    .all()
+    .map((obj) => obj.name);
+
+  const matches = db
+    .prepare(
+      `SELECT IIF(json_extract(value, '$.match') == 1, 'match', 'miss') name FROM (
+          SELECT json_extract(value, '$.results') results
+          FROM match, json_each(match.response)
+          ) t, json_each(t.results)
+        GROUP BY name
+        ORDER BY name ASC`
+    )
+    .all()
+    .map((obj) => obj.name);
+
+  const cameras = db
+    .prepare(
+      `SELECT json_extract(event, '$.camera') name
+      FROM match
+      GROUP BY name
+      ORDER BY name ASC`
+    )
+    .all()
+    .map((obj) => obj.name);
+
+  const types = db
+    .prepare(
+      `SELECT json_extract(event, '$.type') name
+      FROM match
+      GROUP BY name
+      ORDER BY name ASC`
+    )
+    .all()
+    .map((obj) => obj.name);
+
+  res.send({ total: total.count, detectors, names, matches, cameras, types });
 };

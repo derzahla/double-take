@@ -29,7 +29,7 @@ module.exports.subLabel = async (topic, id, best) => {
       data: { subLabel: names, subLabelScore: confidences },
     });
   } catch (error) {
-    console.error(`Post sublabel to frigate for event ${id} failed: ${error.message}`);
+    console.error(`Post sublabel to frigate for event ${id} failed: ${error.message} ${url} ${data}`);
   }
 };
 
