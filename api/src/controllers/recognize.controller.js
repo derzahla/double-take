@@ -206,12 +206,12 @@ module.exports.start = async (req, res) => {
     console.log(`done processing ${camera}: ${id} in ${duration} sec`);
 
     const loggedOutput = JSON.parse(JSON.stringify(output));
-    ['matches', 'misses', 'unknowns'].forEach((type) => {
+    ['matches', 'misses', 'unknowns'].forEach((type) =>
       if (loggedOutput[type]) {
-        loggedOutput[type].forEach((result) => delete result.base64);
+        loggedOutput[type].forEach((result) => delete result.base64)
       }
     });
-    console.log(loggedOutput);
+    console.log(JSON.stringify(loggedOutput, null, 2)); // Re-Stringify to print nested array values
 
     PROCESSING = false;
 
